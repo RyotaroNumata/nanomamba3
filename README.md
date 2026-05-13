@@ -1,82 +1,101 @@
-# nanochat
+# nanomamba3
 
-**English** | [日本語](README_ja.md)
+[English](README_en.md) | **日本語**
 
-> **This fork implements Mamba-3 MIMO from scratch in pure PyTorch — no Triton, no mamba_ssm — and runs the full pipeline from pretraining to bilingual SFT on a single GPU.**
-> We built our own SSM scan (`ssd_siso` / `ssd_mimo`), added data-dependent decay, MIMO rank-R state updates, and partial RoPE on top of the [Mamba-3 paper](https://arxiv.org/abs/2603.15569). The result is a single-file drop-in that plugs into the nanochat training loop alongside the GPT Transformer, complete with ONNX export for on-device inference. See [nanochat/mamba3.py](nanochat/mamba3.py) and [runs/speedrun_mamba3_bilingual_sft.sh](runs/speedrun_mamba3_bilingual_sft.sh).
+> **このフォークでは Mamba-3 MIMO を純粋な PyTorch でスクラッチ実装し、事前学習から英日バイリンガル SFT まで単一 GPU で完走しています。**
+> Triton も mamba_ssm も使わず、SSM スキャン（`ssd_siso` / `ssd_mimo`）・データ依存減衰・MIMO rank-R 状態更新・部分 RoPE を [Mamba-3 論文](https://arxiv.org/abs/2603.15569) をベースに自前実装しました。nanochat の GPT Transformer と同じ学習ループにそのまま差し込める設計で、ONNX エクスポートによるオンデバイス推論にも対応しています。詳細は [nanochat/mamba3.py](nanochat/mamba3.py) と [runs/speedrun_mamba3_bilingual_sft.sh](runs/speedrun_mamba3_bilingual_sft.sh) を参照。
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
 
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
+nanochat は LLM をゼロからトレーニングするための、シンプルで最小限の実験ハーネスです。単一 GPU ノードで動作するよう設計されており、トークナイザー学習・事前学習・ファインチューニング（SFT / RL）・評価・推論・チャット UI まで LLM に必要なすべてのステージをカバーしています。たとえば、2019 年に約 4.3 万ドルかかった GPT-2 相当のモデルを、わずか約 48 ドル（8×H100 ノードで約 2 時間）でトレーニングし、おなじみの ChatGPT 風 Web UI で会話することができます。スポットインスタンスなら約 15 ドルまで下がります。
 
-For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
+複雑さの唯一のダイヤルは `--depth`（Transformer 層数）です。その他のハイパーパラメータ（幅・ヘッド数・学習率・ステップ数・Weight Decay など）はすべて自動的に計算最適な値に設定されます。
 
-## Time-to-GPT-2 Leaderboard
+**このフォークの追加機能**:
+- `NANOCHAT_JA_RATIO` 環境変数を設定するだけで、英語と日本語を混合してトレーニング可能
+- Mamba-3 MIMO rank-2 SSM アーキテクチャ対応（`--model-arch mamba3 --mamba-use-mimo`）
 
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
+---
 
-| # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
-|---|-------------|---------|------|-------------|------|--------|--------------|
-| 0 | 168 hours | - | 0.2565 | Original OpenAI GPT-2 checkpoint | 2019 | - | OpenAI |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained **+fp8** | Feb 2 2026 | a67eba3 | @karpathy |
-| 3 | 2.76 | 0.74645 | 0.2602 | bump total batch size to 1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
-| 4 | 2.02 | 0.71854 | 0.2571 | change dataset to NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
-| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch [round 1](https://x.com/karpathy/status/2031135152349524125) | Mar 9 2026 | 6ed7d1d | @karpathy |
-| 5 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
+## Time-to-GPT-2 リーダーボード
 
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
+現在の開発の主眼は、最も計算コストのかかる事前学習ステージの高速化です。[runs/speedrun.sh](runs/speedrun.sh) スクリプトが常に GPT-2 相当モデルの学習方法のリファレンスです。
 
-See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
+| # | 時間 | val_bpb | CORE | 説明 | 日付 | コミット | 貢献者 |
+|---|------|---------|------|------|------|--------|--------|
+| 0 | 168 時間 | - | 0.2565 | OpenAI GPT-2 オリジナル | 2019 | - | OpenAI |
+| 1 | 3.04 | 0.74833 | 0.2585 | d24 ベースライン | Jan 29 2026 | 348fbb3 | @karpathy |
+| 2 | 2.91 | 0.74504 | 0.2578 | d26 + fp8 | Feb 2 2026 | a67eba3 | @karpathy |
+| 3 | 2.76 | 0.74645 | 0.2602 | バッチサイズ 1M トークンに拡大 | Feb 5 2026 | 2c062aa | @karpathy |
+| 4 | 2.02 | 0.71854 | 0.2571 | データセットを NVIDIA ClimbMix に変更 | Mar 4 2026 | 324e69c | @ddudek @karpathy |
+| 5 | 1.80 | 0.71808 | 0.2690 | 自動研究 round 1 | Mar 9 2026 | 6ed7d1d | @karpathy |
+| 5 | 1.65 | 0.71800 | 0.2626 | 自動研究 round 2 | Mar 14 2026 | a825e63 | @karpathy |
 
-## Getting started
+主要指標は「Time-to-GPT-2」— 8×H100 ノードで GPT-2 (1.6B) の CORE スコア 0.256525 を超えるまでの経過時間です。
 
-### Reproduce and talk to GPT-2
+---
 
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+## クイックスタート
+
+### GPT-2 を再現して会話する（Transformer）
+
+パイプライン全体が [runs/speedrun.sh](runs/speedrun.sh) に収まっています。8×H100 ノードを起動してスクリプトを実行するだけです:
 
 ```bash
 bash runs/speedrun.sh
 ```
 
-You may wish to do so in a screen session as this will take ~3 hours to run. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
+約 3 時間かかるため `screen` セッションでの実行を推奨します。完了後:
 
 ```bash
+source .venv/bin/activate
 python -m scripts.chat_web
 ```
 
-And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
+ブラウザで表示された URL を開いてください（例: `http://209.20.xxx.xxx:8000/`）。
 
----
-
-<img width="2672" height="1520" alt="image" src="https://github.com/user-attachments/assets/ed39ddf8-2370-437a-bedc-0f39781e76b5" />
-
----
-
-A few more notes:
-
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device_batch_size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Mamba-3 MIMO (SSM architecture)
-
-This fork adds a from-scratch pure-PyTorch implementation of Mamba-3 MIMO rank-2, trained end-to-end from pretraining to bilingual (English + Japanese) SFT on a single GPU. See [nanochat/mamba3.py](nanochat/mamba3.py) for the implementation and [nanochat/NOTICE](nanochat/NOTICE) for attribution to the upstream [mamba3-minimal](https://github.com/VikramLex/mamba3-minimal).
+#### バイリンガル（英語 + 日本語）版
 
 ```bash
-# Full pipeline: pretraining → bilingual SFT (single GPU, ~4–5 hrs)
-bash runs/speedrun_mamba3_bilingual_sft.sh
+# 日本語比率 30% がデフォルト
+bash runs/speedrun_bilingual.sh
 
-# Chat with the result (temperature=1.0 recommended for Mamba-3)
-python -m scripts.chat_cli -i sft -g mamba3_mimo_r2_sft -t 1.0 -p "Why is the sky blue?"
+# screen + wandb の場合
+WANDB_RUN=bilingual screen -L -Logfile runs/speedrun_bilingual.log -S bilingual \
+    bash runs/speedrun_bilingual.sh
+
+# 日本語比率を変更する場合
+NANOCHAT_JA_RATIO=0.5 bash runs/speedrun_bilingual.sh
 ```
 
-### Eval scores (SFT, d12, 10k steps)
+---
 
-| Task | GPT Transformer (bilingual_v2) | Mamba-3 MIMO rank-2 |
-|------|-------------------------------|---------------------|
+### Mamba-3 MIMO（SSM アーキテクチャ）
+
+Transformer の代わりに Mamba-3 MIMO rank-2 を使ったバイリンガル学習です。単一 GPU（RTX 3090 / 24GB VRAM 想定）で動作します。
+
+```bash
+bash runs/speedrun_mamba3_bilingual_sft.sh
+
+# タグ指定 + wandb + screen
+MODEL_TAG=mamba3_mimo_r2 WANDB_RUN=mamba3_mimo_r2 \
+    screen -L -Logfile runs/mamba3_bilingual_sft.log -S mamba3sft \
+    bash runs/speedrun_mamba3_bilingual_sft.sh
+```
+
+完了後（Mamba-3 は temperature=1.0 が推奨）:
+
+```bash
+source .venv/bin/activate
+python -m scripts.chat_cli -i sft -g mamba3_mimo_r2_sft -t 1.0 -p "こんにちは！"
+python -m scripts.chat_web
+```
+
+#### Transformer vs Mamba-3 MIMO スコア比較（SFT 後、d12 / 10k steps）
+
+| タスク | Transformer (bilingual_v2) | Mamba-3 MIMO rank-2 |
+|--------|---------------------------|---------------------|
 | ARC-Easy | **36.45%** | 33.50% |
 | ARC-Challenge | **33.28%** | 28.84% |
 | MMLU | **31.89%** | 30.25% |
@@ -87,29 +106,41 @@ python -m scripts.chat_cli -i sft -g mamba3_mimo_r2_sft -t 1.0 -p "Why is the sk
 | Base CORE | — | 0.1122 |
 | ChatCORE | — | 0.1710 |
 
-### Inference speed (RTX 3090, 100 tokens generated, averaged over 3 runs)
+> Transformer と比べて全タスクで若干劣るが、SSM ならではの利点として **O(1) 推論メモリ**（KV キャッシュ不要）があり、長コンテキストで有利。
 
-| Backend | prompt=32 | prompt=128 | prompt=512 | Notes |
-|---------|-----------|------------|------------|-------|
-| Mamba-3 MIMO — CUDA (PyTorch) | 51.1 tok/s | 49.1 tok/s | 51.1 tok/s | Speed is **constant** regardless of prompt length (O(1) recurrent inference) |
-| GPT Transformer — CUDA (PyTorch) | 97.7 tok/s | 99.6 tok/s | 81.6 tok/s | Faster at short prompts; degrades at long context (KV cache growth) |
+#### Transformer との主な違い
+
+| 項目 | Transformer | Mamba-3 MIMO |
+|------|-------------|--------------|
+| `--model-arch` | `transformer`（デフォルト） | `mamba3 --mamba-use-mimo` |
+| `--device-batch-size` | 8 | 2（VRAM 制限） |
+| `--matrix-lr` | 0.003 | 0.001 |
+| 推論メモリ | O(seq_len)（KV キャッシュ） | O(1)（固定サイズ状態） |
+| 推奨 temperature | 0.6 | 1.0 |
+
+#### 推論速度（RTX 3090、100 トークン生成、3回平均）
+
+| バックエンド | prompt=32 | prompt=128 | prompt=512 | 備考 |
+|------------|-----------|------------|------------|------|
+| Mamba-3 MIMO — CUDA (PyTorch) | 51.1 tok/s | 49.1 tok/s | 51.1 tok/s | プロンプト長に**依存しない**（O(1) 再帰推論） |
+| GPT Transformer — CUDA (PyTorch) | 97.7 tok/s | 99.6 tok/s | 81.6 tok/s | 短文は速いが長文で低下（KV キャッシュ肥大化） |
 | Mamba-3 MIMO — CPU (PyTorch) | 21.9 tok/s | 20.8 tok/s | 17.7 tok/s | |
-| Mamba-3 — ONNX fp32 (CPU) | 32.1 tok/s | 18.6 tok/s | 6.9 tok/s | Sequential per-token prefill |
-| Mamba-3 — ONNX fp32 + chunk prefill (CPU) | 38.6 tok/s | 31.7 tok/s | 18.4 tok/s | chunk_size=32; 1.21×/1.71×/2.64× speedup vs sequential |
-| Mamba-3 — ONNX int8 (CPU) | 55.6 tok/s | 32.1 tok/s | 11.8 tok/s | ~1.7× over fp32 |
-| Mamba-3 — ONNX int8 + chunk prefill (CPU) | **64.6 tok/s** | **48.3 tok/s** | **23.6 tok/s** | chunk_size=32; 1.17×/1.50×/2.00× speedup vs sequential; **fastest across all CPU configs** |
+| Mamba-3 — ONNX fp32 (CPU) | 32.1 tok/s | 18.6 tok/s | 6.9 tok/s | 逐次プリフィル（トークンごと） |
+| Mamba-3 — ONNX fp32 + chunk prefill (CPU) | 38.6 tok/s | 31.7 tok/s | 18.4 tok/s | chunk_size=32; 1.21×/1.71×/2.64× 高速化 |
+| Mamba-3 — ONNX int8 (CPU) | 55.6 tok/s | 32.1 tok/s | 11.8 tok/s | fp32 比約 1.7× |
+| Mamba-3 — ONNX int8 + chunk prefill (CPU) | **64.6 tok/s** | **48.3 tok/s** | **23.6 tok/s** | chunk_size=32; 1.17×/1.50×/2.00× 高速化；**CPU 全構成で最速** |
 
-> The O(1) memory property of SSMs means Mamba-3 holds its decode speed as context grows, while the Transformer slows down due to KV cache. At prompt=512, Mamba-3 CUDA (51 tok/s) is already closing the gap with the Transformer (81 tok/s).
-> Chunk prefill amortises the SSD scan cost over 32-token blocks — the longer the prompt, the larger the speedup (2.64× fp32 / 2.00× int8 at 512 tokens).
-> Notably, int8 + chunk prefill at short prompts (64.6 tok/s) beats CUDA PyTorch (51.1 tok/s).
-> Run `python inference_bench.py --no-pytorch` to reproduce the ONNX numbers.
+> SSM の O(1) メモリ特性により、Mamba-3 はコンテキストが長くなっても速度を維持します。
+> chunk prefill は SSD スキャンを 32 トークン単位でバッチ処理するため、プロンプトが長いほど効果大（fp32: 2.64×、int8: 2.00× at 512 tokens）。
+> 短文（prompt=32）では int8 + chunk prefill（64.6 tok/s）が CUDA PyTorch（51.1 tok/s）を上回ります。
+> `python inference_bench.py --no-pytorch` で ONNX 数値を再現可能です。
 
-### ONNX export and on-device inference
+#### ONNX エクスポートとオンデバイス推論
 
-Export a trained Mamba-3 SFT model to ONNX for CPU / mobile deployment:
+学習済み Mamba-3 SFT モデルを ONNX にエクスポートして CPU / モバイル向けに展開できます：
 
 ```bash
-# Export fp32 decode-step model + chunk-prefill model (recommended)
+# fp32 デコードステップ + チャンクプリフィルモデルをエクスポート（推奨）
 python -m scripts.export_onnx \
     --model-tag mamba3_mimo_r2_10k_sft \
     --fp32 \
@@ -117,161 +148,231 @@ python -m scripts.export_onnx \
     --export-prefill \
     --verify
 
-# Quantize to int8 (decode-step and prefill separately)
+# int8 に量子化（デコードとプリフィルを別々に）
 python -c "
 from onnxruntime.quantization import quantize_dynamic, QuantType
-quantize_dynamic('/tmp/mamba3_step_fp32.onnx',        '/tmp/mamba3_step_int8.onnx',        weight_type=QuantType.QInt8)
+quantize_dynamic('/tmp/mamba3_step_fp32.onnx',         '/tmp/mamba3_step_int8.onnx',         weight_type=QuantType.QInt8)
 quantize_dynamic('/tmp/mamba3_step_fp32_prefill.onnx', '/tmp/mamba3_step_int8_prefill.onnx', weight_type=QuantType.QInt8)
 "
 
-# Chat via ONNX (int8 + chunk prefill = fastest CPU config)
+# ONNX でチャット（int8 + chunk prefill = CPU 最速構成）
 python -m scripts.chat_onnx \
     --onnx /tmp/mamba3_step_int8.onnx \
     --onnx-prefill /tmp/mamba3_step_int8_prefill.onnx \
-    -p "Why is the sky blue?"
+    -p "こんにちは！"
 
-# Interactive mode
+# インタラクティブモード
 python -m scripts.chat_onnx \
     --onnx /tmp/mamba3_step_int8.onnx \
     --onnx-prefill /tmp/mamba3_step_int8_prefill.onnx
 ```
 
-File sizes after export: fp32 decode ~528 MB, fp32 prefill ~530 MB, int8 decode ~133 MB, int8 prefill ~135 MB.
+エクスポート後のファイルサイズ: fp32 デコード ~528 MB、fp32 プリフィル ~530 MB、int8 デコード ~133 MB、int8 プリフィル ~135 MB。
 
-## Research
+---
 
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
+## セットアップ
 
-```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
-    --core-metric-every=999999 \
-    --sample-every=-1 \
-    --save-every=-1 \
-```
+### 前提条件
 
-This uses wandb (run name "d12"), only runs the CORE metric on last step, and it doesn't sample and save intermediate checkpoints. I like to change something in the code, re-run a d12 (or a d16 etc) and see if it helped, in an iteration loop. To see if a run helps, I like to monitor the wandb plots for:
+- Python 3.10+
+- [uv](https://github.com/astral-sh/uv) パッケージマネージャ
+- GPU（CUDA 推奨。CPU / Apple Silicon でも動作しますが遅くなります）
 
-1. `val_bpb` (validation loss in vocab-size-invariant units of bits per byte) as a function of `step`, `total_training_time` and `total_training_flops`.
-2. `core_metric` (the DCLM CORE socre)
-3. VRAM utilization, `train/mfu` (Model FLOPS utilization), `train/tok_per_sec` (training throughput)
-
-See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
-
-The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
-
-## Running on CPU / MPS
-
-The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
-
-## Precision / dtype
-
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
-
-| Hardware | Default dtype | Why |
-|----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
-| CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | No reduced-precision tensor cores |
-
-You can override the default with the `NANOCHAT_DTYPE` environment variable:
+### インストール
 
 ```bash
-NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"   # force fp32
-NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # force bf16
+git clone https://github.com/RyotaroNumata/nanomamba3.git
+cd nanomamba3
+uv sync
+source .venv/bin/activate
 ```
 
-How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
+---
 
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT suppors this too but RL currently does not. Inference in fp16 works fine everywhere.
+## 個別ステップの実行
 
-## Guides
+### データセット
 
-I've published a number of guides that might contain helpful information, most recent to least recent:
+```bash
+# 英語データ（ClimbMix-400B）
+python -m nanochat.dataset -n 170
 
-- [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
-- [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
-- To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into the SFT stage.
-- [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
+# 日本語データ（FineWeb-2-edu-japanese）
+python -m nanochat.dataset -n 73 -l ja
+```
 
-## File structure
+### トークナイザー
+
+```bash
+python -m scripts.tok_train   # 学習
+python -m scripts.tok_eval    # 評価
+```
+
+### 事前学習（Pretraining）
+
+```bash
+# 8× GPU ノード（推奨）
+OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=26
+
+# シングル GPU（自動でgrad accum）
+python -m scripts.base_train -- --depth=26
+
+# Mamba-3 MIMO（シングル GPU）
+python -m scripts.base_train \
+    --model-arch=mamba3 --mamba-use-mimo \
+    --depth=12 --device-batch-size=2 --matrix-lr=0.001
+
+# 評価
+python -m scripts.base_eval
+```
+
+### SFT
+
+```bash
+python -m scripts.chat_sft    # 学習
+python -m scripts.chat_eval   # 評価
+```
+
+### 会話
+
+```bash
+# CLI（-p を省略するとインタラクティブモード）
+python -m scripts.chat_cli -p "Why is the sky blue?"
+
+# Web UI
+python -m scripts.chat_web
+```
+
+### 研究・実験用クイックテスト（約 5 分）
+
+```bash
+OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=12 --run="d12" --model-tag="d12" \
+    --core-metric-every=999999 --sample-every=-1 --save-every=-1
+```
+
+---
+
+## CPU / MPS での実行
+
+[runs/runcpu.sh](runs/runcpu.sh) でシンプルな CPU / Apple Silicon デモが動作します。実用的な品質は出ませんが動作確認には便利です。
+
+---
+
+## 精度 / dtype
+
+nanochat は `torch.amp.autocast` を使用しません。代わりに `COMPUTE_DTYPE`（`nanochat/common.py`）で精度を明示管理します。
+
+| ハードウェア | デフォルト dtype | 理由 |
+|-------------|----------------|------|
+| CUDA SM80+（A100, H100） | `bfloat16` | ネイティブ bf16 テンソルコア |
+| CUDA SM<80（V100, T4） | `float32` | bf16 なし（`NANOCHAT_DTYPE=float16` で GradScaler 有効化） |
+| CPU / MPS | `float32` | 低精度テンソルコアなし |
+
+環境変数で上書き可能:
+
+```bash
+NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"
+NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train
+```
+
+---
+
+## 環境変数一覧
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `NANOCHAT_JA_RATIO` | `0.0` | 日本語データの混合比率（0.0 = 英語のみ） |
+| `NANOCHAT_BASE_DIR` | `~/.cache/nanochat` | データ・チェックポイントの保存先 |
+| `NANOCHAT_DTYPE` | 自動検出 | 演算精度（`bfloat16` / `float32` / `float16`） |
+| `WANDB_RUN` | `dummy` | W&B ログのラン名（`dummy` で無効化） |
+| `OMP_NUM_THREADS` | — | マルチ GPU 時は `1` を推奨 |
+| `PYTORCH_ALLOC_CONF` | — | `expandable_segments:True` で VRAM 断片化軽減 |
+
+---
+
+## ファイル構成
 
 ```
 .
 ├── LICENSE
-├── README.md
+├── NOTICE                              # サードパーティライセンス表示
+├── README.md                           # English README
+├── README_ja.md                        # 日本語 README（このファイル）
 ├── dev
-│   ├── gen_synthetic_data.py       # Example synthetic data for identity
-│   ├── generate_logo.html
+│   ├── gen_synthetic_data.py           # identity 会話データ生成例
 │   ├── nanochat.png
-│   └── repackage_data_reference.py # Pretraining data shard generation
+│   └── repackage_data_reference.py
 ├── nanochat
-│   ├── __init__.py                 # empty
-│   ├── checkpoint_manager.py       # Save/Load model checkpoints
-│   ├── common.py                   # Misc small utilities, quality of life
-│   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py               # Tokenizing Distributed Data Loader
-│   ├── dataset.py                  # Download/read utils for pretraining data
-│   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
-│   ├── logo.svg
-│   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
-│   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   ├── report.py                   # Utilities for writing the nanochat Report
-│   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-│   └── ui.html                     # HTML/CSS/JS for nanochat frontend
-├── pyproject.toml
+│   ├── checkpoint_manager.py           # チェックポイント保存・読み込み
+│   ├── common.py                       # 共通ユーティリティ / COMPUTE_DTYPE
+│   ├── core_eval.py                    # DCLM CORE スコア評価
+│   ├── dataloader.py                   # 分散対応データローダー
+│   ├── dataset.py                      # データシャードのダウンロード
+│   ├── engine.py                       # KV キャッシュ推論エンジン
+│   ├── gpt.py                          # GPT Transformer（RoPE, GQA, SwiGLU）
+│   ├── mamba3.py                       # Mamba-3 MIMO SSM（独自改変版）
+│   ├── NOTICE                          # mamba3.py の原著作権表示と改変内容
+│   ├── optim.py                        # AdamW + Muon オプティマイザ
+│   └── tokenizer.py                    # BPE トークナイザー（32K 語彙）
 ├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
+│   ├── speedrun.sh                     # GPT-2 スピードラン（8×H100）
+│   ├── speedrun_bilingual.sh           # バイリンガル Transformer スピードラン
+│   ├── speedrun_bilingual_sft.sh       # バイリンガル Transformer + SFT
+│   ├── speedrun_mamba3.sh              # Mamba-3 事前学習のみ
+│   ├── speedrun_mamba3_bilingual.sh    # Mamba-3 バイリンガル事前学習
+│   └── speedrun_mamba3_bilingual_sft.sh # Mamba-3 バイリンガル + SFT（推奨）
 ├── scripts
-│   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py               # Base model: train
-│   ├── chat_cli.py                 # Chat model: talk to over CLI
-│   ├── chat_eval.py                # Chat model: eval tasks
-│   ├── chat_rl.py                  # Chat model: reinforcement learning
-│   ├── chat_sft.py                 # Chat model: train SFT
-│   ├── chat_web.py                 # Chat model: talk to over WebUI
-│   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
-│   └── tok_train.py                # Tokenizer: train it
-├── tasks
-│   ├── arc.py                      # Multiple choice science questions
-│   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── customjson.py               # Make Task from arbitrary jsonl convos
-│   ├── gsm8k.py                    # 8K Grade School Math questions
-│   ├── humaneval.py                # Misnomer; Simple Python coding task
-│   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   ├── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-│   └── spellingbee.py              # Task teaching model to spell/count letters
-├── tests
-│   └── test_engine.py
-└── uv.lock
+│   ├── base_train.py                   # 事前学習
+│   ├── base_eval.py                    # ベースモデル評価
+│   ├── chat_sft.py                     # SFT 学習
+│   ├── chat_eval.py                    # チャットモデル評価
+│   ├── chat_cli.py                     # CLI チャット
+│   ├── chat_web.py                     # Web UI チャット
+│   ├── export_onnx.py                  # Mamba-3 → ONNX エクスポート
+│   └── chat_onnx.py                    # ONNX モデルでのチャット
+└── tasks
+    ├── arc.py                          # ARC 評価タスク
+    ├── gsm8k.py                        # GSM8K 数学問題
+    ├── humaneval.py                    # Python コーディングタスク
+    ├── jcommonsenseqa.py               # JCommonsenseQA（日本語）
+    ├── japanese_instruct.py            # 日本語 instruction SFT タスク
+    ├── mmlu.py                         # MMLU 多肢選択
+    └── spellingbee.py                  # スペリング・文字カウントタスク
 ```
 
-## Contributing
+---
 
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~3 hours, but by improving the pretraining stage we can improve this further.
+## テスト
 
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
+```bash
+pytest tests/ -v
+pytest tests/ -v -m "not slow"          # 低速テストをスキップ
+```
 
-## Acknowledgements
+---
 
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
-- Thank you to the repo czar Sofie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
+## コントリビューション
 
-## Cite
+nanochat の目標は、1,000 ドル以下の予算でエンドツーエンドに扱えるマイクロモデルの水準を引き上げることです。アクセシビリティはコストだけでなく認知的複雑さにも関わります — nanochat は設定オブジェクトだらけのフレームワークではなく、単一の一貫したコードベースです。
 
-If you find nanochat helpful in your research cite simply as:
+AI 利用ポリシー: PR 提出時は、LLM が実質的に貢献した部分や自分が完全に理解していない部分を開示してください。
+
+---
+
+## 謝辞
+
+- [nanoGPT](https://github.com/karpathy/nanoGPT)（事前学習のみをカバーした先行プロジェクト）
+- [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt)（リーダーボードのアイデアと実装の一部）
+- [HuggingFace](https://huggingface.co/) — FineWeb, SmolTalk データセット
+- [Lambda](https://lambda.ai/service/gpu-cloud) — 開発用コンピュート
+- Mamba-3 実装の元となった [mamba3-minimal](https://github.com/VikramLex/mamba3-minimal)（Apache 2.0, Copyright 2026 Vikram Karlex）
+
+---
+
+## 引用
 
 ```bibtex
 @misc{nanochat,
@@ -283,10 +384,10 @@ If you find nanochat helpful in your research cite simply as:
 }
 ```
 
-## License
+## ライセンス
 
 MIT
 
-### Third-party licenses
+### サードパーティライセンス
 
-[nanochat/mamba3.py](nanochat/mamba3.py) is derived from [mamba3-minimal](https://github.com/VikramLex/mamba3-minimal) (Copyright 2026 Vikram Karlex) and is licensed under the **Apache License 2.0**. See [nanochat/NOTICE](nanochat/NOTICE) for the full attribution and a summary of modifications.
+[nanochat/mamba3.py](nanochat/mamba3.py) は [mamba3-minimal](https://github.com/VikramLex/mamba3-minimal)（Copyright 2026 Vikram Karlex）を元に改変したもので、**Apache License 2.0** のもとで提供されます。詳細な帰属表示と改変内容は [nanochat/NOTICE](nanochat/NOTICE) を参照してください。
