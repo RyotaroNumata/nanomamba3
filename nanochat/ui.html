@@ -331,8 +331,8 @@
             // Add click handler for user messages to enable editing
             if (role === 'user' && messageIndex !== null) {
                 contentDiv.setAttribute('data-message-index', messageIndex);
-                contentDiv.setAttribute('title', 'Click to edit and restart from here');
-                contentDiv.addEventListener('click', function() {
+                contentDiv.setAttribute('title', 'Double-click to edit and restart from here');
+                contentDiv.addEventListener('dblclick', function() {
                     if (!isGenerating) {
                         editMessage(messageIndex);
                     }

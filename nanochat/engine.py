@@ -304,6 +304,75 @@ class Engine:
         return results, masks
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Mamba3 engine adapter
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Mamba3Engine:
+    """
+    Thin adapter that wraps Mamba3Model.generate() to match the Engine interface.
+    Engine uses GPT's KV-cache and cannot be used with Mamba3 directly.
+    This class provides the same .generate() / .generate_batch() API so that
+    chat_sft, chat_eval, chat_cli, and chat_web work unchanged.
+    """
+
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """
+        Matches Engine.generate(): yields (token_column, token_masks).
+        token_column: list of one token per call (num_samples always = 1 here).
+        token_masks: list of 1 (sampled).
+        Stops on <|assistant_end|>, <|bos|>, or max_tokens.
+        """
+        if num_samples != 1:
+            raise NotImplementedError(
+                "Mamba3Engine.generate() only supports num_samples=1; "
+                "use generate_batch() for multiple independent samples."
+            )
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        max_t = max_tokens if max_tokens is not None else self.model.config.sequence_len
+        for token in self.model.generate(tokens, max_tokens=max_t, temperature=temperature, top_k=top_k, seed=seed):
+            yield [token], [1]
+            if token == assistant_end or token == bos:
+                break
+
+    def generate_batch(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """
+        Matches Engine.generate_batch(): returns (results, masks).
+        results: list of full token sequences (prompt + completion, no EOS token).
+        Runs num_samples independent autoregressive generations sequentially.
+        """
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        max_t = max_tokens if max_tokens is not None else self.model.config.sequence_len
+        results, masks = [], []
+        for s in range(num_samples):
+            sample_tokens = list(tokens)
+            sample_masks = [0] * len(tokens)
+            for token in self.model.generate(tokens, max_tokens=max_t, temperature=temperature, top_k=top_k, seed=seed + s):
+                if token == assistant_end or token == bos:
+                    break
+                sample_tokens.append(token)
+                sample_masks.append(1)
+            results.append(sample_tokens)
+            masks.append(sample_masks)
+        return results, masks
+
+
+def create_engine(model, tokenizer):
+    """
+    Factory: return Engine (GPT) or Mamba3Engine depending on model architecture.
+    Detection is based on whether model.config has the GPT-specific n_kv_head attribute.
+    """
+    if hasattr(model, 'config') and hasattr(model.config, 'n_kv_head'):
+        return Engine(model, tokenizer)
+    return Mamba3Engine(model, tokenizer)
+
+
 if __name__ == "__main__":
     """
     Quick inline test to make sure that the naive/slow model.generate function

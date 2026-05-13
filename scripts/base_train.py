@@ -26,14 +26,100 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.mamba3 import Mamba3Model, Mamba3Config
+from nanochat.mamba3_official import Mamba3OfficialModel, Mamba3OfficialConfig
+from nanochat.hybrid import HybridModel, HybridConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
+from nanochat.engine import Engine, create_engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+
+def collect_ssm_stats(model, tokenizer, device):
+    """Collect SSM parameter and activation statistics for mamba3_official models."""
+    import torch.nn.functional as F
+    stats = {}
+
+    # --- Weight stats (no forward pass needed) ---
+    all_mixer_norm, all_mlp_norm, all_out_proj_std, all_in_proj_norm, all_D = [], [], [], [], []
+    all_wgate_std, all_wup_std, all_wdown_std = [], [], []
+    for i, layer in enumerate(model.transformer.h):
+        mn  = layer.mixer_norm.weight.float().detach()
+        mn2 = layer.mlp_norm.weight.float().detach()
+        op  = layer.mixer.out_proj.weight.float().detach()
+        ip  = layer.mixer.in_proj.weight.float().detach()
+        D   = layer.mixer.D.float().detach()
+        wg  = layer.mlp.w_gate.weight.float().detach()
+        wu  = layer.mlp.w_up.weight.float().detach()
+        wd  = layer.mlp.w_down.weight.float().detach()
+        all_mixer_norm.append(mn); all_mlp_norm.append(mn2)
+        all_out_proj_std.append(op.std()); all_in_proj_norm.append(ip.norm())
+        all_D.append(D)
+        all_wgate_std.append(wg.std()); all_wup_std.append(wu.std()); all_wdown_std.append(wd.std())
+        stats[f"ssm/L{i:02d}/mixer_norm_mean"] = mn.mean().item()
+        stats[f"ssm/L{i:02d}/out_proj_std"]    = op.std().item()
+        stats[f"mlp/L{i:02d}/w_gate_std"]      = wg.std().item()
+        stats[f"mlp/L{i:02d}/w_up_std"]        = wu.std().item()
+        stats[f"mlp/L{i:02d}/w_down_std"]      = wd.std().item()
+
+    stats["ssm/mixer_norm_mean"] = torch.stack([m.mean() for m in all_mixer_norm]).mean().item()
+    stats["ssm/mixer_norm_std"]  = torch.stack([m.std()  for m in all_mixer_norm]).mean().item()
+    stats["ssm/mlp_norm_mean"]   = torch.stack([m.mean() for m in all_mlp_norm]).mean().item()
+    stats["ssm/out_proj_std"]    = torch.stack(all_out_proj_std).mean().item()
+    stats["ssm/in_proj_norm"]    = torch.stack(all_in_proj_norm).mean().item()
+    stats["ssm/D_mean"]          = torch.cat([d for d in all_D]).mean().item()
+    stats["mlp/w_gate_std"]      = torch.stack(all_wgate_std).mean().item()
+    stats["mlp/w_up_std"]        = torch.stack(all_wup_std).mean().item()
+    stats["mlp/w_down_std"]      = torch.stack(all_wdown_std).mean().item()
+
+    # --- Activation stats (one small forward pass with hooks) ---
+    captured = {}
+    hooks = []
+    for i, layer in enumerate(model.transformer.h):
+        mx = layer.mixer
+        def make_hook(li, mx):
+            def hook(module, inp, output):
+                proj = output.float()
+                d_inner = mx.d_inner; d_state = mx.d_state
+                num_bc = mx.num_bc_heads; mimo_rank = mx.mimo_rank
+                nheads = mx.nheads; num_rope = mx.num_rope_angles
+                s = [d_inner, d_inner,
+                     d_state*num_bc*mimo_rank, d_state*num_bc*mimo_rank,
+                     nheads, nheads, nheads, num_rope]
+                _, _, B, C, dd_dt, dd_A, _, _ = torch.split(proj, s, dim=-1)
+                A  = -F.softplus(dd_A)
+                DT = F.softplus(dd_dt + mx.dt_bias.float())
+                captured[li] = {
+                    "A_mean": A.mean().item(), "A_std": A.std().item(),
+                    "B_std":  B.std().item(),  "C_std": C.std().item(),
+                    "DT_mean": DT.mean().item(),
+                }
+            return hook
+        hooks.append(mx.in_proj.register_forward_hook(make_hook(i, mx)))
+
+    text = "The history of artificial intelligence began when researchers attempted to create thinking machines."
+    ids = tokenizer.encode(text)
+    input_ids = torch.tensor([ids], device=device)
+    model.eval()
+    with torch.no_grad():
+        model(input_ids)
+    model.train()
+    for h in hooks: h.remove()
+
+    n = len(model.transformer.h)
+    stats["ssm/A_mean"]  = sum(captured[i]["A_mean"]  for i in range(n)) / n
+    stats["ssm/A_std"]   = sum(captured[i]["A_std"]   for i in range(n)) / n
+    stats["ssm/B_std"]   = sum(captured[i]["B_std"]   for i in range(n)) / n
+    stats["ssm/C_std"]   = sum(captured[i]["C_std"]   for i in range(n)) / n
+    stats["ssm/DT_mean"] = sum(captured[i]["DT_mean"] for i in range(n)) / n
+    for i in range(n):
+        stats[f"ssm/L{i:02d}/A_std"] = captured[i]["A_std"]
+        stats[f"ssm/L{i:02d}/B_std"] = captured[i]["B_std"]
+
+    return stats
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -47,11 +133,22 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
+parser.add_argument("--model-arch", type=str, default="transformer", choices=["transformer", "mamba3", "mamba3_official", "hybrid"], help="Model architecture: transformer (GPT), mamba3, mamba3_official (uses mamba_ssm library), or hybrid (Mamba3+Attention)")
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Mamba3-specific
+parser.add_argument("--mamba-d-state", type=int, default=128, help="[mamba3] SSM state dimension N")
+parser.add_argument("--mamba-headdim", type=int, default=64, help="[mamba3] SSM head dimension P")
+parser.add_argument("--mamba-chunk-size", type=int, default=64, help="[mamba3] SSD chunk size Q (MIMO: auto-divided by mimo-rank)")
+parser.add_argument("--mamba-expand", type=int, default=2, help="[mamba3] expansion factor d_inner = expand * n_embd")
+parser.add_argument("--mamba-use-mimo", action="store_true", default=False, help="[mamba3] enable MIMO SSM (chunk_size auto-adjusted to chunk_size//mimo_rank)")
+parser.add_argument("--mamba-mimo-rank", type=int, default=2, help="[mamba3] MIMO rank R")
+parser.add_argument("--mamba-outproj-norm", action="store_true", default=False, help="[mamba3_official] enable RMSNormGated before out_proj (Nemotron-H style)")
+parser.add_argument("--no-tie-embeddings", action="store_true", default=False, help="[mamba3/hybrid] disable wte/lm_head weight tying (default: tied)")
+parser.add_argument("--layer-pattern", type=str, default="MMMMMA", help="[hybrid] layer pattern tiled to depth, 'M'=Mamba3 'A'=Attention (e.g. 'MMMMMA' or 'MMMА')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -63,11 +160,16 @@ parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas; [mamba3_official] mlp_norm etc.)")
+parser.add_argument("--ssm-lr", type=float, default=None, help="[mamba3_official] LR for SSM group (in_proj, out_proj, dynamics, mixer_norm). default: same as matrix-lr")
+parser.add_argument("--uniform-lr", type=float, default=None, help="set all param groups to the same LR (Mamba-2/3 recipe). overrides --matrix-lr/--embedding-lr/--unembedding-lr")
+parser.add_argument("--no-muon", action="store_true", default=False, help="[mamba3_official] use AdamW instead of Muon for MLP matrix params")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--reset-optimizer", action="store_true", default=False, help="when resuming, load model weights only and start with fresh optimizer state")
+parser.add_argument("--grad-clip", type=float, default=0.0, help="gradient clipping max norm (0 = disabled)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -128,24 +230,83 @@ print0(f"Vocab size: {vocab_size:,}")
 
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-    num_heads = model_dim // args.head_dim
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
-    )
-    with torch.device("meta"):
-        model_meta = GPT(config)
+    if args.model_arch == "transformer":
+        # Model dim is nudged up to nearest multiple of head_dim for clean division
+        # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+        model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+        num_heads = model_dim // args.head_dim
+        config = GPTConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=args.window_pattern,
+        )
+        with torch.device("meta"):
+            model_meta = GPT(config)
+    elif args.model_arch == "mamba3":
+        # Mamba3: round model_dim to nearest multiple of mamba_headdim * expand
+        # so that d_inner = expand * model_dim is divisible by headdim
+        if args.layer_pattern != parser.get_default("layer_pattern"):
+            print0(f"NOTE: --layer-pattern={args.layer_pattern!r} is ignored for mamba3 (hybrid only)")
+        expand = args.mamba_expand
+        align = args.mamba_headdim * expand
+        model_dim = ((base_dim + align - 1) // align) * align
+        mimo_rank = args.mamba_mimo_rank if args.mamba_use_mimo else 1
+        config = Mamba3Config(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_embd=model_dim,
+            d_state=args.mamba_d_state,
+            headdim=args.mamba_headdim,
+            chunk_size=args.mamba_chunk_size,
+            expand=expand,
+            tie_embeddings=not args.no_tie_embeddings,
+            mimo_rank=mimo_rank,
+        )
+        with torch.device("meta"):
+            model_meta = Mamba3Model(config)
+    elif args.model_arch == "mamba3_official":
+        if args.layer_pattern != parser.get_default("layer_pattern"):
+            print0(f"NOTE: --layer-pattern={args.layer_pattern!r} is ignored for mamba3_official (hybrid only)")
+        expand = args.mamba_expand
+        align = args.mamba_headdim * expand
+        model_dim = ((base_dim + align - 1) // align) * align
+        config = Mamba3OfficialConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_embd=model_dim,
+            d_state=args.mamba_d_state,
+            headdim=args.mamba_headdim,
+            chunk_size=args.mamba_chunk_size,
+            expand=expand,
+            tie_embeddings=not args.no_tie_embeddings,
+            is_outproj_norm=args.mamba_outproj_norm,
+        )
+        with torch.device("meta"):
+            model_meta = Mamba3OfficialModel(config)
+    elif args.model_arch == "hybrid":
+        # Hybrid: same model_dim rounding as mamba3 (headdim-aligned)
+        align = args.mamba_headdim  # expand=1 in Attention layers, headdim shared
+        model_dim = ((base_dim + align - 1) // align) * align
+        config = HybridConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_embd=model_dim,
+            layer_pattern=args.layer_pattern,
+            d_state=args.mamba_d_state,
+            headdim=args.mamba_headdim,
+            chunk_size=args.mamba_chunk_size,
+            expand=args.mamba_expand,
+            tie_embeddings=not args.no_tie_embeddings,
+        )
+        with torch.device("meta"):
+            model_meta = HybridModel(config)
+    else:
+        raise ValueError(f"Unknown --model-arch: {args.model_arch}")
     return model_meta
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
+model_config_kwargs["model_arch"] = args.model_arch  # store arch so checkpoint_manager can rebuild correctly
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
@@ -165,6 +326,9 @@ if resuming:
 # FP8 training initialization and management (this has to be done before torch.compile)
 
 # Convert Linear layers to Float8Linear if --fp8 is set
+if args.fp8 and args.model_arch in ("mamba3", "mamba3_official"):
+    print0("Warning: FP8 training is not supported for mamba3, ignoring --fp8 flag")
+    args.fp8 = False
 if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
@@ -309,12 +473,15 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
+    ssm_lr=args.ssm_lr * batch_lr_scale if args.ssm_lr is not None else None,
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    uniform_lr=args.uniform_lr * batch_lr_scale if args.uniform_lr is not None else None,
+    no_muon=args.no_muon,
 )
 
-if resuming:
+if resuming and not args.reset_optimizer:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
@@ -364,6 +531,8 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
+        if warmdown_iters == 0:
+            return args.final_lr_frac
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
@@ -375,6 +544,8 @@ def get_muon_momentum(it):
         frac = it / 400
         return (1 - frac) * 0.85 + frac * 0.97
     elif it >= warmdown_start:
+        if warmdown_iters == 0:
+            return 0.90
         progress = (it - warmdown_start) / warmdown_iters
         return 0.97 * (1 - progress) + 0.90 * progress
     else:
@@ -426,12 +597,15 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        log_val = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        if args.model_arch == "mamba3_official" and master_process:
+            log_val.update(collect_ssm_stats(orig_model, tokenizer, device))
+        wandb_run.log(log_val)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -464,7 +638,7 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        engine = create_engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
@@ -526,15 +700,19 @@ while True:
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # In distributed training, all ranks must agree on whether to skip the step.
         # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        # the found_inf flag (MAX = if any rank found inf, all rats skip).
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
         scaler.step(optimizer)
         scaler.update()
     else:
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
@@ -564,7 +742,7 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if step % 1 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,

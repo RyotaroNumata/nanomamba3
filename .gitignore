@@ -1,13 +1,72 @@
+# Python
 .venv/
 __pycache__/
-*.pyc
-dev-ignore/
-report.md
-eval_bundle/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+*.wheel
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Secrets
 .env
+*.key
 
 # Local setup
 CLAUDE.md
 wandb/
+dev-ignore/
+report.md
+eval_bundle/
+
+# Claude Code
+.claude/
+memory/
+
+# Local docs / notes / drafts
+knowledge/
+docs/
+
+# Data files
+data/
+
+# Training logs
+runs/*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ONNX exports (large binaries)
+*.onnx
+
+# Experimental / WIP scripts (not ready for public)
+nanochat/mamba3_official.py
+nanochat/hybrid.py
+scripts/check_step_diff.py
+scripts/bench_mamba3_step.py
+
+# Misc
+.codex

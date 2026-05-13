@@ -1,0 +1,46 @@
+mamba3.py — Notices and Attributions
+=====================================
+
+Original work:
+  mamba3-minimal
+  Copyright 2026 Vikram Karlex
+  Licensed under the Apache License, Version 2.0
+  Source: https://github.com/VikramLex/mamba3-minimal
+
+  A copy of the Apache License 2.0 is available at:
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This file (mamba3.py) is a modified derivative of the above work.
+Modifications are summarised below.
+
+Modifications to the original model
+-------------------------------------
+
+  A (decay parameter)
+    Original:  fixed learnable scalar per head — nn.Parameter A_log of shape
+               (nheads,); decay computed as -exp(A_log), constant across tokens.
+    Modified:  data-dependent per-token per-head value — dd_A is projected from
+               the input via in_proj and decay is computed as -softplus(dd_A),
+               yielding a distinct decay value at each sequence position.
+
+  MIMO rank-R state update
+    Original:  SISO only — state update is a rank-1 outer product B ⊗ x.
+    Modified:  Generalised to rank-R MIMO via ssd_mimo(); the state update
+               becomes a sum of R outer products Σ_r B[:,r] ⊗ x[:,r].
+               mimo_rank=1 recovers the original SISO behaviour exactly.
+
+  Partial RoPE (rope_fraction)
+    Original:  RoPE applied to all d_state dimensions of B and C.
+    Modified:  RoPE applied only to the first d_state * rope_fraction dimensions
+               (rope_fraction=0.5 by default); remaining dims are unrotated.
+
+  B_bias / C_bias initialisation
+    Original:  Initialised to 1.0 as recommended in the paper.
+    Modified:  Initialised to 0.02 for training stability at higher learning
+               rates (empirically validated).
+
+  SSD internal precision
+    Original:  Assumed float32 inputs throughout ssd_siso().
+    Modified:  ssd_siso() and ssd_mimo() cast inputs to float32 internally and
+               cast outputs back to the original dtype, enabling correct
+               operation with bfloat16 inputs.

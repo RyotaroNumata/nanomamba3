@@ -1,5 +1,10 @@
 # nanochat
 
+**English** | [日本語](README_ja.md)
+
+> **This fork implements Mamba-3 MIMO from scratch in pure PyTorch — no Triton, no mamba_ssm — and runs the full pipeline from pretraining to bilingual SFT on a single GPU.**
+> We built our own SSM scan (`ssd_siso` / `ssd_mimo`), added data-dependent decay, MIMO rank-R state updates, and partial RoPE on top of the [Mamba-3 paper](https://arxiv.org/abs/2603.15569). The result is a single-file drop-in that plugs into the nanochat training loop alongside the GPT Transformer, complete with ONNX export for on-device inference. See [nanochat/mamba3.py](nanochat/mamba3.py) and [runs/speedrun_mamba3_bilingual_sft.sh](runs/speedrun_mamba3_bilingual_sft.sh).
+
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
 
@@ -55,6 +60,83 @@ A few more notes:
 - All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
 - If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device_batch_size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
 - Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
+
+## Mamba-3 MIMO (SSM architecture)
+
+This fork adds a from-scratch pure-PyTorch implementation of Mamba-3 MIMO rank-2, trained end-to-end from pretraining to bilingual (English + Japanese) SFT on a single GPU. See [nanochat/mamba3.py](nanochat/mamba3.py) for the implementation and [nanochat/NOTICE](nanochat/NOTICE) for attribution to the upstream [mamba3-minimal](https://github.com/VikramLex/mamba3-minimal).
+
+```bash
+# Full pipeline: pretraining → bilingual SFT (single GPU, ~4–5 hrs)
+bash runs/speedrun_mamba3_bilingual_sft.sh
+
+# Chat with the result (temperature=1.0 recommended for Mamba-3)
+python -m scripts.chat_cli -i sft -g mamba3_mimo_r2_sft -t 1.0 -p "Why is the sky blue?"
+```
+
+### Eval scores (SFT, d12, 10k steps)
+
+| Task | GPT Transformer (bilingual_v2) | Mamba-3 MIMO rank-2 |
+|------|-------------------------------|---------------------|
+| ARC-Easy | **36.45%** | 33.50% |
+| ARC-Challenge | **33.28%** | 28.84% |
+| MMLU | **31.89%** | 30.25% |
+| GSM8K | **5.00%** | 1.06% |
+| HumanEval | **9.15%** | 0.61% |
+| SpellingBee | **99.22%** | 82.81% |
+| JCommonsenseQA | **35.48%** | 33.24% |
+| Base CORE | — | 0.1122 |
+| ChatCORE | — | 0.1710 |
+
+### Inference speed (RTX 3090, 100 tokens generated, averaged over 3 runs)
+
+| Backend | prompt=32 | prompt=128 | prompt=512 | Notes |
+|---------|-----------|------------|------------|-------|
+| Mamba-3 MIMO — CUDA (PyTorch) | 51.1 tok/s | 49.1 tok/s | 51.1 tok/s | Speed is **constant** regardless of prompt length (O(1) recurrent inference) |
+| GPT Transformer — CUDA (PyTorch) | 97.7 tok/s | 99.6 tok/s | 81.6 tok/s | Faster at short prompts; degrades at long context (KV cache growth) |
+| Mamba-3 MIMO — CPU (PyTorch) | 21.9 tok/s | 20.8 tok/s | 17.7 tok/s | |
+| Mamba-3 — ONNX fp32 (CPU) | 32.1 tok/s | 18.6 tok/s | 6.9 tok/s | Sequential per-token prefill |
+| Mamba-3 — ONNX fp32 + chunk prefill (CPU) | 38.6 tok/s | 31.7 tok/s | 18.4 tok/s | chunk_size=32; 1.21×/1.71×/2.64× speedup vs sequential |
+| Mamba-3 — ONNX int8 (CPU) | 55.6 tok/s | 32.1 tok/s | 11.8 tok/s | ~1.7× over fp32 |
+| Mamba-3 — ONNX int8 + chunk prefill (CPU) | **64.6 tok/s** | **48.3 tok/s** | **23.6 tok/s** | chunk_size=32; 1.17×/1.50×/2.00× speedup vs sequential; **fastest across all CPU configs** |
+
+> The O(1) memory property of SSMs means Mamba-3 holds its decode speed as context grows, while the Transformer slows down due to KV cache. At prompt=512, Mamba-3 CUDA (51 tok/s) is already closing the gap with the Transformer (81 tok/s).
+> Chunk prefill amortises the SSD scan cost over 32-token blocks — the longer the prompt, the larger the speedup (2.64× fp32 / 2.00× int8 at 512 tokens).
+> Notably, int8 + chunk prefill at short prompts (64.6 tok/s) beats CUDA PyTorch (51.1 tok/s).
+> Run `python inference_bench.py --no-pytorch` to reproduce the ONNX numbers.
+
+### ONNX export and on-device inference
+
+Export a trained Mamba-3 SFT model to ONNX for CPU / mobile deployment:
+
+```bash
+# Export fp32 decode-step model + chunk-prefill model (recommended)
+python -m scripts.export_onnx \
+    --model-tag mamba3_mimo_r2_10k_sft \
+    --fp32 \
+    --output /tmp/mamba3_step_fp32.onnx \
+    --export-prefill \
+    --verify
+
+# Quantize to int8 (decode-step and prefill separately)
+python -c "
+from onnxruntime.quantization import quantize_dynamic, QuantType
+quantize_dynamic('/tmp/mamba3_step_fp32.onnx',        '/tmp/mamba3_step_int8.onnx',        weight_type=QuantType.QInt8)
+quantize_dynamic('/tmp/mamba3_step_fp32_prefill.onnx', '/tmp/mamba3_step_int8_prefill.onnx', weight_type=QuantType.QInt8)
+"
+
+# Chat via ONNX (int8 + chunk prefill = fastest CPU config)
+python -m scripts.chat_onnx \
+    --onnx /tmp/mamba3_step_int8.onnx \
+    --onnx-prefill /tmp/mamba3_step_int8_prefill.onnx \
+    -p "Why is the sky blue?"
+
+# Interactive mode
+python -m scripts.chat_onnx \
+    --onnx /tmp/mamba3_step_int8.onnx \
+    --onnx-prefill /tmp/mamba3_step_int8_prefill.onnx
+```
+
+File sizes after export: fp32 decode ~528 MB, fp32 prefill ~530 MB, int8 decode ~133 MB, int8 prefill ~135 MB.
 
 ## Research
 
@@ -204,3 +286,7 @@ If you find nanochat helpful in your research cite simply as:
 ## License
 
 MIT
+
+### Third-party licenses
+
+[nanochat/mamba3.py](nanochat/mamba3.py) is derived from [mamba3-minimal](https://github.com/VikramLex/mamba3-minimal) (Copyright 2026 Vikram Karlex) and is licensed under the **Apache License 2.0**. See [nanochat/NOTICE](nanochat/NOTICE) for the full attribution and a summary of modifications.

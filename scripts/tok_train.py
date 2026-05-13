@@ -13,34 +13,78 @@ from nanochat.dataset import parquets_iter_batched
 # -----------------------------------------------------------------------------
 # Parse command line arguments
 
+# When NANOCHAT_JA_RATIO > 0, lower the default max_chars to 500M to avoid
+# OOM during Japanese BPE training (2B chars causes memory exhaustion).
+_ja_ratio = float(os.environ.get("NANOCHAT_JA_RATIO", "0.0"))
+_default_max_chars = 500_000_000 if _ja_ratio > 0.0 else 2_000_000_000
+
 parser = argparse.ArgumentParser(description='Train a BPE tokenizer')
-parser.add_argument('--max-chars', type=int, default=2_000_000_000, help='Maximum characters to train on (default: 10B)')
+parser.add_argument('--max-chars', type=int, default=_default_max_chars,
+                    help='Maximum characters to train on (default: 500M when JA enabled, 2B otherwise)')
 parser.add_argument('--doc-cap', type=int, default=10_000, help='Maximum characters per document (default: 10,000)')
 parser.add_argument('--vocab-size', type=int, default=32768, help='Vocabulary size (default: 32768 = 2^15)')
 args = parser.parse_args()
 print(f"max_chars: {args.max_chars:,}")
 print(f"doc_cap: {args.doc_cap:,}")
 print(f"vocab_size: {args.vocab_size:,}")
+print(f"NANOCHAT_JA_RATIO: {_ja_ratio}")
 
 # -----------------------------------------------------------------------------
 # Text iterator
 
+def _iter_docs(lang, budget):
+    """Yield documents from one language up to `budget` characters."""
+    for batch in parquets_iter_batched(split="train", lang=lang):
+        for doc in batch:
+            text = doc[:args.doc_cap] if len(doc) > args.doc_cap else doc
+            budget -= len(text)
+            yield text
+            if budget <= 0:
+                return
+
 def text_iterator():
     """
-    1) Flatten the batches into a single iterator
-    2) Crop every document to args.doc_cap characters
-    3) Break when we've seen args.max_chars characters
+    Yield documents for tokenizer training.
+
+    When NANOCHAT_JA_RATIO > 0, mixes EN and JA documents according to the
+    ratio so the BPE vocabulary covers both languages.
+    The total character budget is split proportionally between EN and JA.
     """
-    nchars = 0
-    for batch in parquets_iter_batched(split="train"):
-        for doc in batch:
-            doc_text = doc
-            if len(doc_text) > args.doc_cap:
-                doc_text = doc_text[:args.doc_cap]
-            nchars += len(doc_text)
-            yield doc_text
-            if nchars > args.max_chars:
-                return
+    if _ja_ratio <= 0.0:
+        # English-only (original behaviour)
+        nchars = 0
+        for batch in parquets_iter_batched(split="train"):
+            for doc in batch:
+                text = doc[:args.doc_cap] if len(doc) > args.doc_cap else doc
+                nchars += len(text)
+                yield text
+                if nchars >= args.max_chars:
+                    return
+    else:
+        # Bilingual: split the char budget proportionally, then interleave
+        ja_budget = int(args.max_chars * _ja_ratio)
+        en_budget = args.max_chars - ja_budget
+        print(f"Tokenizer training: EN budget {en_budget:,} chars, JA budget {ja_budget:,} chars")
+
+        en_iter = _iter_docs("en", en_budget)
+        ja_iter = _iter_docs("ja", ja_budget)
+
+        # Interleave EN and JA in round-robin at the shard level
+        en_done, ja_done = False, False
+        en_count, ja_count = 0, 0
+        # Desired ratio: yield 1 JA for every (1/ja_ratio - 1) EN docs
+        ja_per_en = _ja_ratio / (1.0 - _ja_ratio)  # e.g. 0.25 for ja_ratio=0.2
+        for doc in en_iter:
+            yield doc
+            en_count += 1
+            # Insert JA docs to maintain the ratio
+            while en_count * ja_per_en > ja_count:
+                try:
+                    yield next(ja_iter)
+                    ja_count += 1
+                except StopIteration:
+                    break
+
 text_iter = text_iterator()
 
 # -----------------------------------------------------------------------------

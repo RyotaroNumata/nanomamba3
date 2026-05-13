@@ -221,8 +221,11 @@ def main():
     samples = []
     unconditioned_samples = []
 
+    # Detect model arch for conditional feature support
+    is_mamba3 = not is_hf_model and hasattr(model, 'config') and not hasattr(model.config, 'n_kv_head')
+
     # --- Sampling ---
-    if 'sample' in eval_modes and not is_hf_model:
+    if 'sample' in eval_modes and not is_hf_model and not is_mamba3:
         print0("\n" + "="*80)
         print0("Model Samples")
         print0("="*80)
@@ -254,6 +257,8 @@ def main():
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)
+    elif 'sample' in eval_modes and is_mamba3:
+        print0("\nSkipping sampling for Mamba3 models (Engine uses GPT KV-cache; use model.generate() directly)")
     elif 'sample' in eval_modes and is_hf_model:
         print0("\nSkipping sampling for HuggingFace models (not supported)")
 

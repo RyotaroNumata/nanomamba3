@@ -8,20 +8,23 @@ python -m scripts.chat_eval -a ARC-Easy
 torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
+import os
 import argparse
 from functools import partial
 import torch
 import torch.distributed as dist
+import wandb
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, DummyWandb
 from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+from nanochat.engine import create_engine
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
 from tasks.spellingbee import SpellingBee
+from tasks.jcommonsenseqa import JCommonsenseQA
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
@@ -165,6 +168,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
         'GSM8K': partial(GSM8K, subset="main", split="test"),
         'SpellingBee': partial(SpellingBee, size=256, split="test"),
+        'JCommonsenseQA': partial(JCommonsenseQA, split="validation"),
     }[task_name]
     task_object = task_module()
     # Run the evaluation
@@ -192,13 +196,19 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--run', type=str, default='dummy', help="wandb run name ('dummy' disables wandb logging)")
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
+    # wandb logging init
+    master_process = ddp_rank == 0
+    use_dummy_wandb = args.run == "dummy" or not master_process
+    wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=vars(args))
+
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
-    engine = Engine(model, tokenizer)
+    engine = create_engine(model, tokenizer)
 
     # Get the tasks to evaluate on
     all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
@@ -209,7 +219,11 @@ if __name__ == "__main__":
         'GSM8K': 0.0, # open-ended => 0%
         'HumanEval': 0.0, # open-ended => 0%
         'SpellingBee': 0.0, # open-ended => 0%
+        'JCommonsenseQA': 0.2, # multiple choice 1 of 5 => 20%
     }
+    # Add Japanese evaluation task when bilingual training is enabled
+    if float(os.environ.get("NANOCHAT_JA_RATIO", "0.0")) > 0.0:
+        all_tasks.append('JCommonsenseQA')
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
     # Run all the task evaluations sequentially
@@ -247,5 +261,11 @@ if __name__ == "__main__":
         results,
         chatcore_metric_dict,
     ])
+
+    # Log to wandb
+    wandb_log = {f"eval/{k}": v for k, v in results.items()}
+    wandb_log.update({f"eval/{k}": v for k, v in chatcore_metric_dict.items()})
+    wandb_run.log(wandb_log)
+    wandb_run.finish()
 
     compute_cleanup()

@@ -139,6 +139,19 @@ Geometrically, the identity says: ``adding up $1^3,2^3,\dots,n^3$ builds a perfe
 \end{document}
 """.strip()
 
+japanese_text = r"""
+自然言語処理（NLP）は、人間が日常的に使っている自然言語をコンピュータに処理させる技術・研究分野の総称である。
+具体的には、テキストや音声などの形で表現された自然言語を、コンピュータで分析・理解・生成することを目指す。
+近年のディープラーニングの急速な発展により、大規模言語モデル（LLM）が登場し、
+機械翻訳・文書要約・質問応答・対話システムなど多岐にわたるタスクで人間に匹敵するか、
+あるいはそれを超える性能を示すようになった。
+日本語は、ひらがな・カタカナ・漢字・アルファベットが混在する複雑な表記体系を持ち、
+さらに助詞や助動詞による格変化、敬語体系の存在など、英語とは異なる言語的特性を持つ。
+そのため、日本語に特化した形態素解析や、バイトペア符号化（BPE）に基づくトークナイザの設計が重要となる。
+大規模言語モデルのトレーニングに際しては、英語と日本語のデータを適切な比率で混合することで、
+両言語に対応したバイリンガルモデルの構築が可能となる。
+""".strip()
+
 science_text = r"""
 Photosynthesis is a photochemical energy transduction process in which light-harvesting pigment–protein complexes within the thylakoid membranes of oxygenic phototrophs absorb photons and initiate charge separation at the reaction center, driving the linear electron transport chain from water to NADP⁺ via photosystem II, the cytochrome b₆f complex, and photosystem I, concomitantly generating a trans-thylakoid proton motive force utilized by chloroplastic ATP synthase. The light-dependent reactions produce ATP and NADPH, which fuel the Calvin–Benson–Bassham cycle in the stroma, wherein ribulose-1,5-bisphosphate is carboxylated by ribulose-1,5-bisphosphate carboxylase/oxygenase (RuBisCO) to form 3-phosphoglycerate, subsequently reduced and regenerated through a series of enzymatic steps, enabling net assimilation of CO₂ into triose phosphates and ultimately carbohydrates. This process is tightly regulated by photoprotective mechanisms, redox feedback, and metabolite flux, representing a central biochemical pathway coupling solar energy capture to the biosphere’s primary productivity.
 """.strip()
@@ -152,6 +165,7 @@ val_text = "\n".join(val_docs)
 all_text = [
     ("news", news_text),
     ("korean", korean_text),
+    ("japanese", japanese_text),
     ("code", code_text),
     ("math", math_text),
     ("science", science_text),

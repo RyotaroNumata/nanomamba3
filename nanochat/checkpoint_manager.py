@@ -93,16 +93,48 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
-    log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
-    with torch.device("meta"):
-        model = GPT(model_config)
+
+    # Determine model architecture: stored in model_config (new) or user_config (legacy mamba3).
+    # Old GPT checkpoints have neither field; default to "transformer".
+    model_arch = model_config_kwargs.pop("model_arch", None)
+    if model_arch is None:
+        model_arch = meta_data.get("user_config", {}).get("model_arch", "transformer")
+
+    log0(f"Building {model_arch} model with config: {model_config_kwargs}")
+
+    if model_arch == "transformer":
+        _patch_missing_config_keys(model_config_kwargs)
+        model_config = GPTConfig(**model_config_kwargs)
+        _patch_missing_keys(model_data, model_config)
+        with torch.device("meta"):
+            model = GPT(model_config)
+    elif model_arch == "mamba3":
+        from nanochat.mamba3 import Mamba3Model, Mamba3Config
+        model_config = Mamba3Config(**model_config_kwargs)
+        with torch.device("meta"):
+            model = Mamba3Model(model_config)
+    elif model_arch == "hybrid":
+        from nanochat.hybrid import HybridModel, HybridConfig
+        model_config = HybridConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = HybridModel(model_config)
+    elif model_arch == "mamba3_official":
+        from nanochat.mamba3_official import Mamba3OfficialModel, Mamba3OfficialConfig
+        model_config = Mamba3OfficialConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = Mamba3OfficialModel(model_config)
+    else:
+        raise ValueError(f"Unknown model_arch in checkpoint: {model_arch!r}")
+
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+    # assign=True replaces each parameter with a fresh tensor, breaking weight tying.
+    # Re-tie lm_head <-> wte after loading.
+    if hasattr(model, 'config') and getattr(model.config, 'tie_embeddings', False):
+        if hasattr(model, 'lm_head') and hasattr(model, 'transformer'):
+            model.lm_head.weight = model.transformer.wte.weight
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()

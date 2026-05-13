@@ -11,6 +11,10 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+# Mamba3 has ~10 unique parameter shapes (vs GPT's ~6), so raise the compile cache
+# limit to avoid FailOnRecompileLimitHit when using AdamW for all param groups.
+torch._dynamo.config.cache_size_limit = 32
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.

@@ -7,7 +7,7 @@ python -m scripts.chat_cli
 import argparse
 import torch
 from nanochat.common import compute_init, autodetect_device_type
-from nanochat.engine import Engine
+from nanochat.engine import create_engine
 from nanochat.checkpoint_manager import load_model
 
 parser = argparse.ArgumentParser(description='Chat with the model')
@@ -15,8 +15,9 @@ parser.add_argument('-i', '--source', type=str, default="sft", help="Source of t
 parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
-parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
+parser.add_argument('-t', '--temperature', type=float, default=1.0, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
+parser.add_argument('-m', '--max-tokens', type=int, default=256, help='Maximum tokens to generate')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 args = parser.parse_args()
 
@@ -31,8 +32,8 @@ bos = tokenizer.get_bos_token_id()
 user_start, user_end = tokenizer.encode_special("<|user_start|>"), tokenizer.encode_special("<|user_end|>")
 assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>"), tokenizer.encode_special("<|assistant_end|>")
 
-# Create Engine for efficient generation
-engine = Engine(model, tokenizer)
+# Create engine (Engine for GPT, Mamba3Engine for Mamba3)
+engine = create_engine(model, tokenizer)
 
 print("\nNanoChat Interactive Mode")
 print("-" * 50)
@@ -77,7 +78,7 @@ while True:
     conversation_tokens.append(assistant_start)
     generate_kwargs = {
         "num_samples": 1,
-        "max_tokens": 256,
+        "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_k": args.top_k,
     }

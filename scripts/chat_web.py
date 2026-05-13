@@ -46,7 +46,7 @@ from typing import List, Optional, AsyncGenerator
 from dataclasses import dataclass
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+from nanochat.engine import Engine, create_engine
 
 # Abuse prevention limits
 MAX_MESSAGES_PER_REQUEST = 500
@@ -120,7 +120,7 @@ class WorkerPool:
                 print(f"Loading model on {device_type}...")
 
             model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
-            engine = Engine(model, tokenizer)
+            engine = create_engine(model, tokenizer)
             worker = Worker(
                 gpu_id=gpu_id,
                 device=device,

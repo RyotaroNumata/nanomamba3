@@ -1,6 +1,8 @@
 """
 CustomJSON task for loading conversations from JSONL files.
-Each line in the JSONL file should be a JSON array of messages.
+Each line can be either:
+1) A JSON array of messages
+2) A JSON object with a "messages" field containing the message array
 """
 
 import os
@@ -10,8 +12,13 @@ from tasks.common import Task
 class CustomJSON(Task):
     """
     Load conversations from a JSONL file.
-    Each line should be a JSON array of message objects with 'role' and 'content' fields.
-    Example line: [{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}]
+    Each line should be either:
+    - a JSON array of message objects with 'role' and 'content' fields
+    - a JSON object containing a "messages" array in that same format
+    Example line:
+    [{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}]
+    or
+    {"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello"}]}
     """
 
     def __init__(self, filepath, **kwargs):
@@ -37,7 +44,13 @@ class CustomJSON(Task):
                     line = line.strip()
                     if not line:  # skip empty lines
                         continue
-                    messages = json.loads(line)
+                    payload = json.loads(line)
+                    if isinstance(payload, dict):
+                        assert "messages" in payload, "Expected dict payload to include 'messages' key"
+                        messages = payload["messages"]
+                    else:
+                        messages = payload
+
                     # Validate the conversation structure
                     assert isinstance(messages, list), f"Expected list of messages, got {type(messages)}"
                     assert len(messages) >= 2, f"Conversation must have at least 2 messages, got {len(messages)}"
@@ -62,4 +75,3 @@ class CustomJSON(Task):
             "messages": messages,
         }
         return conversation
-

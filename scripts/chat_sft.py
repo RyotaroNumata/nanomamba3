@@ -22,8 +22,9 @@ from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimi
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
-from nanochat.engine import Engine
+from nanochat.engine import create_engine
 from scripts.chat_eval import run_chat_eval
+from dataclasses import asdict
 
 from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
@@ -31,6 +32,10 @@ from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.japanese_instruct import JapaneseInstruct
+from tasks.dolly_ja import DollyJa
+from tasks.oasst2_ja import OASST2Ja
+from tasks.magpie_ja import MagpieJa
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -40,7 +45,8 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
-parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
+parser.add_argument("--model-tag", type=str, default=None, help="base model tag to load from (default: auto-detect)")
+parser.add_argument("--output-tag", type=str, default=None, help="tag for SFT checkpoint save dir (default: same as model-tag or depth)")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 # Training horizon
@@ -53,6 +59,8 @@ parser.add_argument("--total-batch-size", type=int, default=None, help="total ba
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
+parser.add_argument("--ssm-lr", type=float, default=None, help="[mamba3_official] LR for SSM group (default: inherit from pretrain)")
+parser.add_argument("--no-muon", action="store_true", default=False, help="[mamba3_official] use AdamW instead of Muon for MLP matrix params (default: inherit from pretrain)")
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -66,6 +74,8 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--dolly-ja-epochs", type=int, default=2, help="number of epochs of DollyJa (default: 2)")
+parser.add_argument("--oasst2-ja-epochs", type=int, default=2, help="number of epochs of OASST2Ja (default: 2)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -88,12 +98,13 @@ else:
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
-# Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
-
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+
+# Flash Attention status (only relevant for GPT transformer; Mamba3 uses Triton SSD kernels)
+_is_mamba3 = meta.get("user_config", {}).get("model_arch", "transformer") == "mamba3"
+if not HAS_FA3 and not _is_mamba3:
+    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -104,6 +115,7 @@ for name, fallback, source in [
     ("embedding_lr",      0.3,   pretrain_user_config),
     ("unembedding_lr",    0.004, pretrain_user_config),
     ("matrix_lr",         0.02,  pretrain_user_config),
+    ("ssm_lr",            None,  pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -115,6 +127,13 @@ for name, fallback, source in [
         print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained value of {pretrain_val}")
     else:
         print0(f"Using {name}={arg_val}")
+
+# Inherit no_muon from pretrain if not explicitly set
+if not args.no_muon:
+    pretrain_no_muon = pretrain_user_config.get("no_muon", False)
+    if pretrain_no_muon:
+        args.no_muon = True
+        print0("Inherited no_muon=True from pretrained checkpoint")
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -131,7 +150,7 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0, ssm_lr=args.ssm_lr, no_muon=args.no_muon)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -160,6 +179,16 @@ for group in optimizer.param_groups:
     group["lr"] = group["lr"] * args.init_lr_frac
     group["initial_lr"] = group["lr"]
 
+# Japanese bilingual support: add JA tasks when NANOCHAT_JA_RATIO > 0
+_ja_ratio = float(os.environ.get("NANOCHAT_JA_RATIO", "20.0"))
+_ja_enabled = _ja_ratio > 0.0
+if _ja_enabled:
+    print0(f"Bilingual SFT enabled (NANOCHAT_JA_RATIO={_ja_ratio}): adding JapaneseInstruct task")
+    # Path to Japanese identity conversations shipped with the repo
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.dirname(_script_dir)
+    ja_identity_filepath = os.path.join(_project_root, "data", "identity_conversations_ja.jsonl")
+
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_tasks = [
@@ -170,6 +199,14 @@ train_tasks = [
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    # Bilingual: add Japanese instruction data when JA ratio is set
+    *([
+        JapaneseInstruct(split="train", stop=920000),                          # ~920K rows (2× SmolTalk size)
+        *[DollyJa()   for _ in range(args.dolly_ja_epochs)],                  # 15K × dolly-ja-epochs
+        *[OASST2Ja()  for _ in range(args.oasst2_ja_epochs)],                 # 33K × oasst2-ja-epochs
+        MagpieJa(),                                                            # ~132K high-quality JA SFT
+        CustomJSON(filepath=ja_identity_filepath),                             # Japanese identity conversations
+    ] if _ja_enabled else []),
 ]
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
@@ -365,13 +402,17 @@ while True:
     chatcore_results = {}
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
-        engine = Engine(orig_model, tokenizer)
+        engine = create_engine(orig_model, tokenizer)
         all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
         categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
         baseline_accuracies = {
             'ARC-Easy': 0.25, 'ARC-Challenge': 0.25, 'MMLU': 0.25,
             'GSM8K': 0.0, 'HumanEval': 0.0, 'SpellingBee': 0.0,
+            'JCommonsenseQA': 0.2,
         }
+        if _ja_enabled:
+            all_tasks.append('JCommonsenseQA')
+            categorical_tasks.add('JCommonsenseQA')
         task_results = {}
         for task_name in all_tasks:
             limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
@@ -397,7 +438,7 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+        output_dirname = args.output_tag or args.model_tag or f"d{depth}"
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -408,13 +449,9 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
+                    **asdict(orig_model.config),
+                    "model_arch": meta.get("user_config", {}).get("model_arch", "transformer"),
+                    "sequence_len": args.max_seq_len,  # may be overridden from pretrain
                 },
                 "user_config": user_config, # inputs to the training script
             },
