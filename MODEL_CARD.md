@@ -41,7 +41,7 @@ No Triton, no `mamba_ssm` — the SSM scan (`ssd_siso` / `ssd_mimo`), data-depen
 
 ```bash
 git clone https://github.com/RyotaroNumata/nanomamba3.git
-cd nanochat
+cd nanomamba3
 uv sync
 source .venv/bin/activate
 ```
@@ -157,6 +157,6 @@ The rest of the nanochat codebase is MIT licensed.
   author = {Andrej Karpathy},
   title  = {nanochat: The best ChatGPT that $100 can buy},
   year   = {2025},
-  url    = {https://github.com/karpathy/nanochat}
+  url    = {https://github.com/RyotaroNumata/nanomamba3}
 }
 ```

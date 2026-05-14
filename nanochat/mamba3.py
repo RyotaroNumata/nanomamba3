@@ -11,14 +11,9 @@ Adapted from: https://github.com/VikramLex/mamba3-minimal
 Lahoti et al., ICLR 2026. arXiv:2603.15569
 
 Modifications to the original model (see also nanochat/NOTICE):
-  [~] A (decay): fixed A_log per head → data-dependent dd_A per token per head
-      (-softplus(dd_A) projected from in_proj at each sequence position)
-  [+] MIMO rank-R: SISO-only ssd_siso() → generalised ssd_mimo() with rank-R
-      outer-product state updates; mimo_rank=1 recovers original SISO behaviour
-  [~] Partial RoPE (rope_fraction): RoPE on all d_state dims → only first
-      d_state * rope_fraction dims rotated (default 0.5)
+  [~] A (decay): fixed nn.Parameter (A_log) → projected from input via in_proj (dd_A)
   [~] B_bias / C_bias init: 1.0 (paper) → 0.02 (empirically more stable)
-  [~] SSD precision: float32-only inputs → internal fp32 cast, bfloat16-safe
+  [~] SSD precision: no explicit cast → internal fp32 cast, bfloat16-safe
 
 Key Mamba-3 innovations over Mamba-2:
   1. Trapezoidal discretization (second-order accurate state update)
@@ -35,71 +30,11 @@ nanochat interface: forward(), generate(), setup_optimizer(),
                    estimate_flops(), num_scaling_params(), init_weights()
 
 ────────────────────────────────────────────────────────────────────────────────
-Changes from mamba3-minimal (upstream)
+Changes from mamba3-minimal (upstream)  — see also nanochat/NOTICE
 ────────────────────────────────────────────────────────────────────────────────
-
-Architecture
-  [+] MIMO rank-R extension (mimo_rank config, ssd_mimo(), _forward_mimo,
-      _step_mimo): generalises the SISO outer-product state update to rank R.
-      mimo_rank=1 recovers the original SISO behaviour exactly.
-  [+] SwiGLU MLP added to each layer (Mamba3Layer = SSM block + SwiGLU).
-      The original minimal implementation had no MLP sublayer.
-  [+] Partial RoPE (rope_fraction): only the first split=d_state*rope_fraction
-      dims of B/C are rotated. rope_fraction=1.0 gives the original full RoPE.
-  [+] is_outproj_norm: optional RMSNorm before out_proj (Nemotron-H style).
-  [~] A: fixed learnable scalar per head (A_log parameter, -exp(A_log)) in the
-      original → data-dependent per-token per-head (dd_A projected from in_proj,
-      -softplus(dd_A)) in nanochat. This is the most significant architectural
-      departure from mamba3-minimal; it aligns more closely with the intent of
-      the Mamba-3 paper (data-dependent decay) though the minimal reference
-      implementation kept A fixed.
-  [+] A_floor: configurable lower bound for data-dependent A (clamp max=-A_floor)
-      for numerical stability.
-  [+] tie_embeddings: optional weight tying between wte and lm_head.
-  [+] Vocab padding to multiple of 64 (wte/lm_head allocate a padded size;
-      logits are sliced back to vocab_size at the output).
-
-Initialisation
-  [~] B_bias / C_bias init changed from paper's 1.0 → 0.02 (matches
-      mamba3_official; empirically more stable at lr~3e-3).
-  [+] Explicit init_weights() with Xavier-uniform for in_proj, zeros for
-      out_proj/MLP down-proj, softplus-inverse for dt_bias, ones for RMSNorm.
-  [+] to_empty() + meta-device init pattern: init_weights() re-ties lm_head ↔
-      wte after loading because assign=True in load_state_dict breaks the tie.
-
-Inference
-  [+] InferenceCache extended for MIMO: k_state/v_state gain an extra R dim
-      when mimo_rank > 1.  InferenceCache.alloc() handles both shapes.
-  [+] Chunk prefill in generate(): prompt tokens are processed in
-      chunk_size-aligned blocks (full-sequence SSD path) rather than one token
-      at a time, giving O(L/Q) prefill cost instead of O(L).
-  [~] generate() yields tokens one at a time (streaming) rather than returning
-      the full sequence, matching nanochat's engine interface.
-
-Training / optimiser
-  [+] nanochat interface: forward(idx, targets, kv_cache, loss_reduction),
-      setup_optimizer(), estimate_flops(), num_scaling_params().
-  [+] Detailed parameter groups with separate LRs:
-        ssm_proj (in/out_proj)   — weight_decay=0, ssm_lr
-        ssm_bias (B/C_bias)      — weight_decay=0, ssm_lr
-        ssm_norm (RMSNorm)       — weight_decay=0, ssm_lr
-        ssm_dyn  (D, dt_bias)    — weight_decay=0, ssm_lr × 0.1
-        mlp                      — weight_decay=wd, matrix_lr
-        embedding / lm_head      — separate LRs
-  [+] MuonAdamW / DistMuonAdamW optimizer support (DDP-aware).
-  [+] uniform_lr mode: bypasses per-group LRs for paper-style training.
-  [+] COMPUTE_DTYPE integration: fp32 master-weight Linear, auto bfloat16/fp32
-      selection based on hardware (via nanochat.common.COMPUTE_DTYPE).
-  [+] estimate_flops(): accounts for MIMO rank R and two-SSD decomposition.
-  [+] num_scaling_params(): reports wte, lm_head, matrices, scalars separately.
-
-Numerics
-  [~] ssd_siso() / ssd_mimo() cast all inputs to float32 internally to avoid
-      overflow in exp/cumsum with bfloat16 inputs; output is cast back to the
-      original dtype. The upstream minimal implementation assumed float32 inputs.
-  [~] Manual RMSNorm (x * rsqrt(...)) used in generate() decode path and in
-      scripts/export_onnx.py instead of F.rms_norm, to avoid aten::rms_norm
-      which is unsupported in ONNX opset < 18.
+  [~] A: fixed nn.Parameter (A_log) → projected from input via in_proj (dd_A)
+  [~] B_bias / C_bias init: 1.0 (torch.ones) → 0.02
+  [~] SSD precision: inputs assumed float32 → internal fp32 cast, bfloat16-safe
 ────────────────────────────────────────────────────────────────────────────────
 """
 
